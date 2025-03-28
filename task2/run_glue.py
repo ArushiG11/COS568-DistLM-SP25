@@ -443,9 +443,6 @@ def main():
     if args.local_rank in [-1, 0]:
         evaluate(args, model, tokenizer, prefix="")
 
-    if args.local_rank != -1:
-        dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
