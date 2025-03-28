@@ -55,7 +55,7 @@ def set_seed(args):
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
-
+    args.train_batch_size = args.per_device_train_batch_size
     args.num_train_epochs = 1
     # train_sampler = RandomSampler(train_dataset)
     if args.local_rank != -1:
