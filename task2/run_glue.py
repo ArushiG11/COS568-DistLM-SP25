@@ -190,8 +190,7 @@ def train(args, train_dataset, model, tokenizer):
             train_iterator.close()
             break
 
-        if args.local_rank in [-1, 0]:
-            evaluate(args, model, tokenizer, prefix=f"epoch_{tr}")
+        evaluate(args, model, tokenizer, prefix=f"epoch_{tr}")
     
 
     if len(iteration_times) > 1:
@@ -219,8 +218,8 @@ def train(args, train_dataset, model, tokenizer):
 
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
-    eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
+    eval_task_names = (args.task_name,)
+    eval_outputs_dirs = (args.output_dir,)
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
@@ -231,7 +230,10 @@ def evaluate(args, model, tokenizer, prefix=""):
 
         args.eval_batch_size = args.per_device_eval_batch_size
         # Note that DistributedSampler samples randomly
-        eval_sampler = SequentialSampler(eval_dataset)
+        if args.local_rank != -1:
+            eval_sampler = DistributedSampler(eval_dataset, shuffle=False)
+        else:
+            eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         # Eval!
@@ -270,13 +272,13 @@ def evaluate(args, model, tokenizer, prefix=""):
             preds = np.squeeze(preds)
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
-
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank in [-1, 0]:
+            output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
 
     return results
 
@@ -476,8 +478,7 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    if args.do_eval and args.local_rank in [-1, 0]:
-        evaluate(args, model, tokenizer, prefix="")
+    evaluate(args, model, tokenizer, prefix="")
 
 
 if __name__ == "__main__":
