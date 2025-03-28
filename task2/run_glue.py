@@ -92,7 +92,8 @@ def train(args, train_dataset, model, tokenizer):
         )
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    # Train!
+    from math import floor
+    logger = logging.getLogger(__name__)
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
@@ -192,10 +193,7 @@ def train(args, train_dataset, model, tokenizer):
         if args.local_rank in [-1, 0]:
             evaluate(args, model, tokenizer, prefix=f"epoch_{tr}")
     
-    from math import floor
-    logger = logging.getLogger(__name__)
 
-    # 4) Discard the timing of the *first* iteration
     if len(iteration_times) > 1:
         # Remove the first iteration
         iteration_times = iteration_times[1:]
