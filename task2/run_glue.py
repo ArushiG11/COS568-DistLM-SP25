@@ -1,18 +1,3 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa)."""
 
 from __future__ import absolute_import, division, print_function
@@ -27,8 +12,7 @@ import torch.distributed as dist
 
 import numpy as np
 import torch
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
@@ -137,60 +121,57 @@ def train(args, train_dataset, model, tokenizer):
                     scaled_loss.backward()
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
-                
                 loss.backward() 
 
                 # Distributed Gradient Averaging using gather -> average -> scatter
                 if args.local_rank != -1:
-                    grads = []
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            grads.append(param.grad.view(-1))
-                    grads_tensor = torch.cat(grads)
+                    world_size = dist.get_world_size()
+                    rank = dist.get_rank()
 
-                    # Gather gradients on rank 0
-                    gathered = [torch.zeros_like(grads_tensor) for _ in range(args.world_size)] if args.local_rank == 0 else None
-                    dist.gather(grads_tensor, gather_list=gathered, dst=0)
+                    for name, param in model.named_parameters():
+                        if param.grad is None:
+                            continue
+                        grad = param.grad
 
-                    # Average on rank 0 and scatter back
-                    if args.local_rank == 0:
-                        mean_grads = torch.stack(gathered).mean(dim=0)
-                    else:
-                        mean_grads = torch.zeros_like(grads_tensor)
+                        # Gather the gradient from all ranks on rank=0
+                        gather_list = []
+                        if rank == 0:
+                            gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
+                        dist.gather(grad, gather_list=gather_list if rank == 0 else None, dst=0)
 
-                    dist.scatter(mean_grads, scatter_list=[mean_grads] * args.world_size if args.local_rank == 0 else [], src=0)
+                        # On rank 0, compute the average
+                        if rank == 0:
+                            avg = torch.zeros_like(grad)
+                            for g in gather_list:
+                                avg += g
+                            avg /= world_size
+                        else:
+                            avg = torch.zeros_like(grad)
 
-                    # Load averaged gradients back into model
-                    pointer = 0
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            numel = param.grad.numel()
-                            param.grad.copy_(mean_grads[pointer:pointer + numel].view_as(param.grad))
-                            pointer += numel
+                        # Scatter the averaged gradient back to all ranks
+                        dist.scatter(avg, scatter_list=[avg]*world_size if rank == 0 else None, src=0)
 
+                        # Overwrite this param's grad with the averaged version
+                        param.grad = avg
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
 
+            # Print first 5 losses
             if step < 5:
                 print(f"Step {step + 1}, Loss: {loss.item():.4f}")
-                
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                ##################################################
-                # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
                 optimizer.step() 
-                ##################################################
-                scheduler.step() # Update learning rate schedule
+                scheduler.step()
                 model.zero_grad()
                 global_step += 1
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
+
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
@@ -387,14 +368,11 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
-    parser.add_argument("--master_ip", type=str, default="127.0.0.1",
-                    help="IP address of master node for distributed training")
-    parser.add_argument("--master_port", type=str, default="12345",
-                        help="Port on master for distributed training")
-    parser.add_argument("--world_size", type=int, default=1,
-                        help="Total number of distributed processes")
+    parser.add_argument("--master_ip", type=str, default="127.0.0.1")
+    parser.add_argument("--master_port", type=str, default="12345")
+    parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--local_rank", type=int, default=-1)
 
-    
     args = parser.parse_args()
 
 
