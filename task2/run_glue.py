@@ -440,7 +440,8 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    evaluate(args, model, tokenizer, prefix="")
+    if args.local_rank in [-1, 0]:
+        evaluate(args, model, tokenizer, prefix="")
 
     if args.local_rank != -1:
         dist.destroy_process_group()
