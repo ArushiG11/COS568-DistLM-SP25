@@ -371,7 +371,6 @@ def main():
     parser.add_argument("--master_ip", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="12345")
     parser.add_argument("--world_size", type=int, default=1)
-    parser.add_argument("--local_rank", type=int, default=-1)
 
     args = parser.parse_args()
 
