@@ -56,7 +56,7 @@ def set_seed(args):
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
-    args.train_batch_size = args.per_device_train_batch_size
+    args.num_train_epochs = 1
     # train_sampler = RandomSampler(train_dataset)
     if args.local_rank != -1:
         train_sampler = DistributedSampler(train_dataset)
@@ -78,13 +78,19 @@ def train(args, train_dataset, model, tokenizer):
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if args.max_steps > 0:
+        t_total = args.max_steps
+        args.num_train_epochs = (
+            args.max_steps //
+            (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+        )
+    else:
+        t_total = (
+            len(train_dataloader) //
+            args.gradient_accumulation_steps *
+            args.num_train_epochs
+        )
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     # Train!
     logger.info("***** Running training *****")
@@ -99,11 +105,16 @@ def train(args, train_dataset, model, tokenizer):
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
+    iteration_times = []
+    loss_curve = []
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for tr in train_iterator:
+        if args.local_rank != -1 and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(tr)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            start_time = time.perf_counter()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -116,47 +127,45 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                loss.backward() 
+            
+            loss.backward() 
+            loss_val = loss.item()
+            tr_loss += loss_val
+            loss_curve.append(loss_val)
 
-                # Distributed Gradient Averaging using gather -> average -> scatter
-                if args.local_rank != -1:
-                    world_size = dist.get_world_size()
-                    rank = dist.get_rank()
+            # Distributed Gradient Averaging using gather -> average -> scatter
+            if args.local_rank != -1:
+                world_size = dist.get_world_size()
+                rank = dist.get_rank()
 
-                    for name, param in model.named_parameters():
-                        if param.grad is None:
-                            continue
-                        grad = param.grad
+                for name, param in model.named_parameters():
+                    if param.grad is None:
+                        continue
+                    grad = param.grad
 
-                        # Gather the gradient from all ranks on rank=0
-                        gather_list = []
-                        if rank == 0:
-                            gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
-                        dist.gather(grad, gather_list=gather_list if rank == 0 else None, dst=0)
+                    # Gather the gradient from all ranks on rank=0
+                    gather_list = []
+                    if rank == 0:
+                        gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
+                    dist.gather(grad, gather_list=gather_list if rank == 0 else None, dst=0)
 
-                        # On rank 0, compute the average
-                        if rank == 0:
-                            avg = torch.zeros_like(grad)
-                            for g in gather_list:
-                                avg += g
-                            avg /= world_size
-                        else:
-                            avg = torch.zeros_like(grad)
+                    # On rank 0, compute the average
+                    if rank == 0:
+                        avg = torch.zeros_like(grad)
+                        for g in gather_list:
+                            avg += g
+                        avg /= world_size
+                    else:
+                        avg = torch.zeros_like(grad)
 
-                        # Scatter the averaged gradient back to all ranks
-                        dist.scatter(avg, scatter_list=[avg]*world_size if rank == 0 else None, src=0)
+                    # Scatter the averaged gradient back to all ranks
+                    dist.scatter(avg, scatter_list=[avg]*world_size if rank == 0 else None, src=0)
 
-                        # Overwrite this param's grad with the averaged version
-                        param.grad = avg
+                    # Overwrite this param's grad with the averaged version
+                    param.grad = avg
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-            tr_loss += loss.item()
 
             # Print first 5 losses
             if step < 5:
@@ -168,18 +177,46 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+            end_time = time.perf_counter()
+            iteration_times.append(end_time - start_time)
+
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
 
         
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        if args.local_rank in [-1, 0]:
-            evaluate(args, model, tokenizer, prefix=f"epoch_{_}")
-        ##################################################
+        if args.max_steps > 0 and global_step > args.max_steps:
+            train_iterator.close()
+            break
 
-    return global_step, tr_loss / global_step
+        if args.local_rank in [-1, 0]:
+            evaluate(args, model, tokenizer, prefix=f"epoch_{tr}")
+    
+    from math import floor
+    logger = logging.getLogger(__name__)
+
+    # 4) Discard the timing of the *first* iteration
+    if len(iteration_times) > 1:
+        # Remove the first iteration
+        iteration_times = iteration_times[1:]
+        # Compute average
+        avg_time = sum(iteration_times) / len(iteration_times)
+        logger.info(f"[Rank {args.local_rank}] Average iteration time (excluding first): {avg_time:.4f} sec")
+    else:
+        logger.info(f"[Rank {args.local_rank}] Not enough steps to compute average iteration time")
+
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    rank_suffix = f"_rank_{args.local_rank}" if args.local_rank != -1 else "_rank_0"
+    loss_curve_path = os.path.join(args.output_dir, f"loss_curve{rank_suffix}.txt")
+
+    with open(loss_curve_path, "w") as f:
+        for l in loss_curve:
+            f.write(f"{l}\n")
+
+    logger.info(f"[Rank {args.local_rank}] Loss curve saved to {loss_curve_path}")
+
+    return global_step, (tr_loss / max(1, global_step))
 
 
 def evaluate(args, model, tokenizer, prefix=""):
